@@ -24,11 +24,22 @@ export function midpoint(a, b) {
   return { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
 }
 
-const VIS = 0.35; // minimum landmark visibility to trust an angle
+const VIS = 0.25; // minimum landmark visibility to trust an angle (loose enough for front-on views where one side self-occludes)
 
 function ang(lm, i, j, k) {
   if ((lm[i].visibility ?? 1) < VIS || (lm[j].visibility ?? 1) < VIS || (lm[k].visibility ?? 1) < VIS) return null;
   return calcAngle(lm[i], lm[j], lm[k]);
+}
+
+// Pick the arm/leg side with the highest visibility — works for front view
+// (both visible, pick whichever is cleaner this frame) and side view (only one
+// side is visible at all). For curls specifically the user usually moves both
+// arms in sync, so either side reflects the rep.
+function bestSide(rightVal, leftVal, rightVis, leftVis) {
+  if (rightVal != null && leftVal != null) {
+    return (rightVis ?? 1) >= (leftVis ?? 1) ? rightVal : leftVal;
+  }
+  return rightVal ?? leftVal;
 }
 
 // Extract useful metrics from the 33 MediaPipe landmarks
@@ -54,11 +65,24 @@ export function extractMetrics(lm) {
   const elbowAsymmetry = (rightElbow != null && leftElbow != null)
     ? Math.abs(rightElbow - leftElbow) : null;
 
+  // Worst visibility along each chain — used by getAngle pickers to choose
+  // the more reliable side from the current camera angle.
+  const visMin = (...idxs) => Math.min(...idxs.map(i => lm[i].visibility ?? 1));
+  const rightArmVis  = visMin(12, 14, 16);
+  const leftArmVis   = visMin(11, 13, 15);
+  const rightLegVis  = visMin(24, 26, 28);
+  const leftLegVis   = visMin(23, 25, 27);
+  const rightHipVis  = visMin(12, 24, 26);
+  const leftHipVis   = visMin(11, 23, 25);
+
   return {
     rightElbow, leftElbow,
     rightKnee, leftKnee,
     rightShoulder, leftShoulder,
     rightHip, leftHip,
+    rightArmVis, leftArmVis,
+    rightLegVis, leftLegVis,
+    rightHipVis, leftHipVis,
     spineTilt, hipTilt, shoulderTilt, elbowAsymmetry,
     rightWristY: lm[16].y, leftWristY: lm[15].y,
     noseY: lm[0].y, shoulderY: sMid.y,
@@ -68,7 +92,23 @@ export function extractMetrics(lm) {
   };
 }
 
-// Rep counter — state machine with angle smoothing and auto-initialisation
+// View-aware picker for two-arm exercises. Prefers the arm with higher
+// landmark visibility, falls back to whichever side has data.
+function bestElbow(m) {
+  return bestSide(m.rightElbow, m.leftElbow, m.rightArmVis, m.leftArmVis);
+}
+function bestKnee(m) {
+  return bestSide(m.rightKnee, m.leftKnee, m.rightLegVis, m.leftLegVis);
+}
+function bestHipAngle(m) {
+  return bestSide(m.rightHip, m.leftHip, m.rightHipVis, m.leftHipVis);
+}
+
+// Rep counter — bidirectional zone-transition counter.
+// Anchors at the first extreme zone reached (top OR bottom), so the user can
+// enter the frame already mid-rep, half-flexed, or in any position. A full
+// rep = one complete cycle (anchor → opposite extreme → anchor) that spans at
+// least `minRepRange` and lasts at least `minRepMs`.
 export class RepCounter {
   constructor({
     getAngle,
@@ -88,23 +128,24 @@ export class RepCounter {
     this.endTolerance = endTolerance;
     this.minRepRange = minRepRange ?? Math.max(26, Math.abs(highThreshold - lowThreshold) * 0.75);
     this.minRepMs = minRepMs;
+    this._init();
+  }
+
+  _init() {
     this.count = 0;
-    this.phase = 'seeking_start'; // seeking_start | at_start | moving | at_end | returning
-    this._buf = []; // smoothing buffer
-    this._repStart = null;
+    this._buf = [];
+    this._lastAngle = null;
+    this._lastZone = null;     // last extreme zone we were in ('top'|'bottom')
+    this._anchorZone = null;   // which extreme the user first reached
+    this._topExtreme = null;   // best (max) angle observed in top zone this cycle
+    this._bottomExtreme = null;// best (min) angle observed in bottom zone this cycle
+    this._currentRepStart = null;
     this.repDurations = [];
     this.repRanges = [];
-    this._rangeMin = Infinity;
-    this._rangeMax = -Infinity;
-    this._lastAngle = null;
-    this._direction = 0;
-    this._startAngle = null;
-    this._endExtreme = null;
-    this._startHoldFrames = 0;
-    this._endHoldFrames = 0;
-    this._returnHoldFrames = 0;
     this.lastRep = null;
   }
+
+  reset() { this._init(); }
 
   _smooth(raw) {
     this._buf.push(raw);
@@ -112,129 +153,103 @@ export class RepCounter {
     return this._buf.reduce((s, v) => s + v, 0) / this._buf.length;
   }
 
+  // Hysteresis-friendly zone classifier. Returns 'top', 'bottom', or 'mid'.
+  _zoneOf(a) {
+    if (a >= this.high - this.startTolerance) return 'top';
+    if (a <= this.low + this.endTolerance) return 'bottom';
+    return 'mid';
+  }
+
   update(metrics, ts) {
     const raw = this.getAngle(metrics);
     if (raw == null) return;
     const a = this._smooth(raw);
-    const delta = this._lastAngle == null ? 0 : a - this._lastAngle;
-    if (Math.abs(delta) > 1.2) this._direction = Math.sign(delta);
     this._lastAngle = a;
 
-    const atStart = this._isAtStart(a);
-    const atEnd = this._isAtEnd(a);
+    const zone = this._zoneOf(a);
 
-    if (this.phase === 'seeking_start') {
-      if (atStart) this._startHoldFrames++;
-      else this._startHoldFrames = 0;
-      if (this._startHoldFrames >= 2) this._lockStart(a);
+    // Track running extremes so partial entries into a zone still register
+    // their peak/valley before we leave the zone.
+    if (zone === 'top') {
+      this._topExtreme = this._topExtreme == null ? a : Math.max(this._topExtreme, a);
+    } else if (zone === 'bottom') {
+      this._bottomExtreme = this._bottomExtreme == null ? a : Math.min(this._bottomExtreme, a);
+    }
+
+    // Only act on transitions between extreme zones; mid-range motion is just
+    // travel and the hysteresis prevents jittery toggling at the boundaries.
+    if (zone === 'mid' || zone === this._lastZone) return;
+
+    this._lastZone = zone;
+
+    if (this._anchorZone == null) {
+      // First extreme observed: anchor the cycle here. We discard whatever
+      // partial range came before because we don't know if the user was
+      // already mid-rep when they entered the frame.
+      this._anchorZone = zone;
+      this._currentRepStart = ts;
+      if (zone === 'top') this._bottomExtreme = null;
+      else this._topExtreme = null;
       return;
     }
 
-    this._rangeMin = Math.min(this._rangeMin, a);
-    this._rangeMax = Math.max(this._rangeMax, a);
-
-    if (this.phase === 'at_start' && this._movedAwayFromStart(a)) {
-      this.phase = 'moving';
-      this._repStart = ts;
-      this.lastRep = null;
+    if (zone !== this._anchorZone) {
+      // Half-cycle: user reached the opposite extreme. Wait for the return.
+      return;
     }
 
-    if (this.phase === 'moving') {
-      this._endExtreme = this._endExtreme == null
-        ? a
-        : (this.invert ? Math.max(this._endExtreme, a) : Math.min(this._endExtreme, a));
-      if (atEnd && this._rangeMax - this._rangeMin >= this.minRepRange) this._endHoldFrames++;
-      else this._endHoldFrames = 0;
-      if (this._endHoldFrames >= 1) this.phase = 'at_end';
+    // Full cycle complete: anchor → opposite → anchor.
+    const top = this._topExtreme;
+    const bot = this._bottomExtreme;
+    if (top == null || bot == null) {
+      this._currentRepStart = ts;
+      return;
     }
 
-    if (this.phase === 'at_end' && this._returnedTowardStart(a)) {
-      this.phase = 'returning';
+    const range = top - bot;
+    const duration = this._currentRepStart == null ? null : ts - this._currentRepStart;
+    const longEnough = duration == null || duration >= this.minRepMs;
+
+    if (range >= this.minRepRange && longEnough) {
+      this.count++;
+      const startAng = this._anchorZone === 'top' ? top : bot;
+      const endAng   = this._anchorZone === 'top' ? bot : top;
+      this.lastRep = {
+        range,
+        duration,
+        // Side-agnostic extremes: form checks should prefer these so they
+        // stay correct regardless of which side the user anchored on.
+        topAngle: top,
+        bottomAngle: bot,
+        // Anchor-relative aliases (kept for any caller that thinks in
+        // start/end terms): startAngle = where the rep began, endAngle = the
+        // far extreme reached.
+        startAngle: startAng,
+        endAngle: endAng,
+        fullStart: this._anchorZone === 'top'
+          ? top >= this.high - this.startTolerance
+          : bot <= this.low + this.endTolerance,
+        fullEnd: this._anchorZone === 'top'
+          ? bot <= this.low + this.endTolerance
+          : top >= this.high - this.startTolerance,
+      };
+      if (duration != null) {
+        this.repDurations.push(duration);
+        if (this.repDurations.length > 12) this.repDurations.shift();
+      }
+      this.repRanges.push(range);
+      if (this.repRanges.length > 12) this.repRanges.shift();
     }
 
-    if (this.phase === 'returning' && atStart) this._returnHoldFrames++;
-    else if (this.phase === 'returning') this._returnHoldFrames = 0;
-
-    if (this.phase === 'returning' && this._returnHoldFrames >= 1 && this._isLongEnough(ts)) {
-      this._finishRep(ts);
-      this._lockStart(a);
-    }
+    // Reset for next rep — keep current anchor extreme, drop the opposite.
+    this._currentRepStart = ts;
+    if (this._anchorZone === 'top') this._bottomExtreme = null;
+    else this._topExtreme = null;
   }
 
-  _isAtStart(a) {
-    return this.invert ? a <= this.low + this.startTolerance : a >= this.high - this.startTolerance;
-  }
-
-  _isAtEnd(a) {
-    return this.invert ? a >= this.high - this.endTolerance : a <= this.low + this.endTolerance;
-  }
-
-  _lockStart(a) {
-    this.phase = 'at_start';
-    this._startAngle = a;
-    this._rangeMin = a;
-    this._rangeMax = a;
-    this._endExtreme = null;
-    this._repStart = null;
-    this._startHoldFrames = 0;
-    this._endHoldFrames = 0;
-    this._returnHoldFrames = 0;
-  }
-
-  _movedAwayFromStart(a) {
-    if (this._startAngle == null) return false;
-    const minExit = Math.max(22, this.minRepRange * 0.4);
-    return this.invert
-      ? a - this._startAngle >= minExit
-      : this._startAngle - a >= minExit;
-  }
-
-  _returnedTowardStart(a) {
-    if (this._endExtreme == null) return false;
-    return this.invert
-      ? this._endExtreme - a >= Math.min(12, this.minRepRange * 0.4)
-      : a - this._endExtreme >= Math.min(12, this.minRepRange * 0.4);
-  }
-
-  _isLongEnough(ts) {
-    return this._repStart == null || ts - this._repStart >= this.minRepMs;
-  }
-
-  lockStart(metrics) {
-    const raw = this.getAngle(metrics);
-    if (raw == null) return false;
-    const a = this._smooth(raw);
-    if (!this._isAtStart(a)) return false;
-    this._lockStart(a);
-    this._lastAngle = a;
-    return true;
-  }
-
-  _finishRep(ts) {
-    const range = this._rangeMax - this._rangeMin;
-    const duration = this._repStart == null ? null : ts - this._repStart;
-    if (range < this.minRepRange || (duration != null && duration < this.minRepMs)) return;
-
-    this.count++;
-    if (this._repStart != null) {
-      this.repDurations.push(duration);
-      if (this.repDurations.length > 12) this.repDurations.shift();
-    }
-    this.lastRep = {
-      range,
-      duration,
-      startAngle: this._startAngle,
-      endAngle: this._endExtreme,
-      fullStart: this._startAngle != null && this._isAtStart(this._startAngle),
-      fullEnd: this._endExtreme != null && this._isAtEnd(this._endExtreme),
-    };
-    this.repRanges.push(range);
-    if (this.repRanges.length > 12) this.repRanges.shift();
-    this._rangeMin = Infinity;
-    this._rangeMax = -Infinity;
-    this._endExtreme = null;
-    this._repStart = null;
-  }
+  // Kept for API compatibility with older callers. The new state machine
+  // auto-anchors on the first observed extreme, so explicit locking is a no-op.
+  lockStart(_metrics) { return true; }
 
   // Returns null if insufficient data, otherwise { slowingFactor, rangeLoss, isNearFailure }
   getFailureIndicators() {
@@ -259,26 +274,19 @@ export class RepCounter {
   }
 
   get phaseName() {
-    if (this.phase === 'at_start') return this.invert ? 'rack' : 'extended';
-    if (this.phase === 'at_end')   return this.invert ? 'lockout' : 'contracted';
-    if (this.phase === 'seeking_start') return 'setup';
+    if (this._anchorZone == null) return 'ready';
+    const oppositeZone = this._anchorZone === 'top' ? 'bottom' : 'top';
+    if (this._lastZone === this._anchorZone) {
+      return this._anchorZone === 'top' ? 'extended' : 'contracted';
+    }
+    if (this._lastZone === oppositeZone) {
+      return this._anchorZone === 'top' ? 'contracted' : 'extended';
+    }
     return 'moving';
-  }
-
-  reset() {
-    this.count = 0; this.phase = 'seeking_start'; this._buf = [];
-    this._repStart = null; this.repDurations = []; this.repRanges = [];
-    this._rangeMin = Infinity; this._rangeMax = -Infinity;
-    this._lastAngle = null; this._direction = 0;
-    this._startAngle = null; this._endExtreme = null;
-    this._startHoldFrames = 0; this._endHoldFrames = 0; this._returnHoldFrames = 0;
-    this.lastRep = null;
   }
 }
 
 // ─── Exercise Library ────────────────────────────────────────────────────────
-
-function avg2(a, b) { return (a != null && b != null) ? (a + b) / 2 : (a ?? b); }
 
 export const EXERCISES = {
   pullup: {
@@ -287,17 +295,16 @@ export const EXERCISES = {
     category: 'Upper Body',
     repBased: true,
     repCounter: {
-      getAngle: m => avg2(m.rightElbow, m.leftElbow),
+      getAngle: bestElbow,
       highThreshold: 150, lowThreshold: 80, invert: false, minRepRange: 55, minRepMs: 500,
     },
-    // Keep start gate angle-first so camera framing doesn't block activation.
-    isStartPosition: (m, angle) => angle >= 136,
-    startCue: 'Reach full hang to start',
+    startCue: 'Pull up to begin counting',
     formChecks(m, repCounter) {
       const issues = [];
       const score_base = 100;
-      if (repCounter?.lastRep && repCounter.lastRep.startAngle < 150) issues.push('incomplete arm extension');
-      if (repCounter?.lastRep && repCounter.lastRep.endAngle > 85) issues.push('not high enough at top');
+      const lr = repCounter?.lastRep;
+      if (lr && lr.topAngle < 150) issues.push('incomplete arm extension');
+      if (lr && lr.bottomAngle > 85) issues.push('not high enough at top');
       if (m.elbowAsymmetry > 24) issues.push(`arm imbalance (${Math.round(m.elbowAsymmetry)}°)`);
       if (m.hipTilt > 12) issues.push('torso swinging');
       if (m.spineTilt > 28) issues.push('excessive lean');
@@ -312,16 +319,15 @@ export const EXERCISES = {
     category: 'Upper Body',
     repBased: true,
     repCounter: {
-      getAngle: m => avg2(m.rightElbow, m.leftElbow),
+      getAngle: bestElbow,
       highThreshold: 150, lowThreshold: 80, invert: false, minRepRange: 55, minRepMs: 500,
     },
-    // Keep start gate angle-first so camera framing doesn't block activation.
-    isStartPosition: (m, angle) => angle >= 136,
-    startCue: 'Reach full hang to start',
+    startCue: 'Pull up to begin counting',
     formChecks(m, repCounter) {
       const issues = [];
-      if (repCounter?.lastRep && repCounter.lastRep.startAngle < 150) issues.push('incomplete arm extension');
-      if (repCounter?.lastRep && repCounter.lastRep.endAngle > 85) issues.push('not high enough at top');
+      const lr = repCounter?.lastRep;
+      if (lr && lr.topAngle < 150) issues.push('incomplete arm extension');
+      if (lr && lr.bottomAngle > 85) issues.push('not high enough at top');
       if (m.elbowAsymmetry > 24) issues.push(`arm imbalance (${Math.round(m.elbowAsymmetry)}°)`);
       if (m.hipTilt > 12) issues.push('swinging');
       return { issues, score: Math.max(0, 100 - issues.length * 25) };
@@ -335,15 +341,15 @@ export const EXERCISES = {
     category: 'Bodyweight',
     repBased: true,
     repCounter: {
-      getAngle: m => avg2(m.rightElbow, m.leftElbow),
+      getAngle: bestElbow,
       highThreshold: 155, lowThreshold: 90, invert: false, minRepRange: 50, minRepMs: 450,
     },
-    isStartPosition: (m, angle) => angle >= 140 && m.spineTilt > 35,
-    startCue: 'Lock out arms in plank',
+    startCue: 'Push up to begin counting',
     formChecks(m, repCounter) {
       const issues = [];
-      if (repCounter?.lastRep && repCounter.lastRep.startAngle < 150) issues.push('incomplete lockout');
-      if (repCounter?.lastRep && repCounter.lastRep.endAngle > 95) issues.push('not low enough');
+      const lr = repCounter?.lastRep;
+      if (lr && lr.topAngle < 150) issues.push('incomplete lockout');
+      if (lr && lr.bottomAngle > 95) issues.push('not low enough');
       if (m.spineTilt < 45) issues.push('hips not aligned — plank position');
       if (m.elbowAsymmetry > 22) issues.push('uneven push');
       if (m.hipTilt > 14) issues.push('hip rotation');
@@ -358,15 +364,15 @@ export const EXERCISES = {
     category: 'Arms',
     repBased: true,
     repCounter: {
-      getAngle: m => avg2(m.rightElbow, m.leftElbow),
+      getAngle: bestElbow,
       highThreshold: 155, lowThreshold: 65, invert: false, minRepRange: 70, minRepMs: 420,
     },
-    isStartPosition: (m, angle) => angle >= 140,
-    startCue: 'Straighten arms to start',
+    startCue: 'Curl to begin counting',
     formChecks(m, repCounter) {
       const issues = [];
-      if (repCounter?.lastRep && repCounter.lastRep.startAngle < 150) issues.push('incomplete arm extension');
-      if (repCounter?.lastRep && repCounter.lastRep.endAngle > 70) issues.push('not curled high enough');
+      const lr = repCounter?.lastRep;
+      if (lr && lr.topAngle < 150) issues.push('incomplete arm extension');
+      if (lr && lr.bottomAngle > 70) issues.push('not curled high enough');
       if (m.hipTilt > 14 || m.spineTilt > 26) issues.push('body swinging — strict form');
       if (m.elbowAsymmetry > 18) issues.push(`uneven curl (${Math.round(m.elbowAsymmetry)}°)`);
       return { issues, score: Math.max(0, 100 - issues.length * 25) };
@@ -380,15 +386,15 @@ export const EXERCISES = {
     category: 'Arms',
     repBased: true,
     repCounter: {
-      getAngle: m => m.rightElbow ?? m.leftElbow,
+      getAngle: bestElbow,
       highThreshold: 155, lowThreshold: 65, invert: false, minRepRange: 70, minRepMs: 420,
     },
-    isStartPosition: (m, angle) => angle >= 140,
-    startCue: 'Straighten arm to start',
+    startCue: 'Curl to begin counting',
     formChecks(m, repCounter) {
       const issues = [];
-      if (repCounter?.lastRep && repCounter.lastRep.startAngle < 150) issues.push('incomplete arm extension');
-      if (repCounter?.lastRep && repCounter.lastRep.endAngle > 70) issues.push('not curled high enough');
+      const lr = repCounter?.lastRep;
+      if (lr && lr.topAngle < 150) issues.push('incomplete arm extension');
+      if (lr && lr.bottomAngle > 70) issues.push('not curled high enough');
       if (m.hipTilt > 14 || m.spineTilt > 24) issues.push('too much body swing');
       return { issues, score: Math.max(0, 100 - issues.length * 25) };
     },
@@ -402,11 +408,10 @@ export const EXERCISES = {
     repBased: true,
     repCounter: {
       // Overhead extension: starts with elbows bent (low angle), extends to high
-      getAngle: m => avg2(m.rightElbow, m.leftElbow),
+      getAngle: bestElbow,
       highThreshold: 150, lowThreshold: 80, invert: true,
     },
-    isStartPosition: (m, angle) => angle <= 110,
-    startCue: 'Bend elbows overhead to start',
+    startCue: 'Extend overhead to begin counting',
     formChecks(m) {
       const issues = [];
       if (m.spineTilt > 28) issues.push('leaning too far back');
@@ -422,11 +427,10 @@ export const EXERCISES = {
     category: 'Legs',
     repBased: true,
     repCounter: {
-      getAngle: m => avg2(m.rightKnee, m.leftKnee),
+      getAngle: bestKnee,
       highThreshold: 150, lowThreshold: 105, invert: false,
     },
-    isStartPosition: (m, angle) => angle >= 130,
-    startCue: 'Stand tall to start',
+    startCue: 'Squat to begin counting',
     formChecks(m) {
       const issues = [];
       if (m.spineTilt > 42) issues.push('excessive forward lean');
@@ -444,11 +448,10 @@ export const EXERCISES = {
     category: 'Compound',
     repBased: true,
     repCounter: {
-      getAngle: m => avg2(m.rightHip, m.leftHip),
+      getAngle: bestHipAngle,
       highThreshold: 148, lowThreshold: 95, invert: false,
     },
-    isStartPosition: (m, angle) => angle >= 128,
-    startCue: 'Stand tall to start',
+    startCue: 'Stand up to begin counting',
     formChecks(m) {
       const issues = [];
       if (m.spineTilt > 45) issues.push('back rounding — STOP, reset form');
@@ -466,11 +469,10 @@ export const EXERCISES = {
     repBased: true,
     repCounter: {
       // Starts at rack (~80° elbow), extends to lockout (~165°)
-      getAngle: m => avg2(m.rightElbow, m.leftElbow),
+      getAngle: bestElbow,
       highThreshold: 145, lowThreshold: 95, invert: true,
     },
-    isStartPosition: (m, angle) => angle <= 120,
-    startCue: 'Hold rack position to start',
+    startCue: 'Press up to begin counting',
     formChecks(m) {
       const issues = [];
       if (m.spineTilt > 30) issues.push('excessive back arch — lower weight');
@@ -486,11 +488,10 @@ export const EXERCISES = {
     category: 'Compound',
     repBased: true,
     repCounter: {
-      getAngle: m => avg2(m.rightElbow, m.leftElbow),
+      getAngle: bestElbow,
       highThreshold: 125, lowThreshold: 95, invert: false,
     },
-    isStartPosition: (m, angle) => angle >= 108,
-    startCue: 'Lock out to start',
+    startCue: 'Press up to begin counting',
     formChecks(m) {
       const issues = [];
       if (m.elbowAsymmetry > 22) issues.push('uneven press');

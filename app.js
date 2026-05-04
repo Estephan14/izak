@@ -75,9 +75,9 @@ let firstRepFeedbackDone = false;
 let pendingRepFeedback = false;
 let serverConfig = { openrouter: false, elevenlabs: false };
 
-const START_HOLD_MS = 1000;
-const START_GRACE_MS = 450;
-const ACTIVE_EXIT_DEG = 25;
+const READY_HOLD_MS = 250;       // brief stable-pose check before going 'ready'
+const POSE_LOST_GRACE_MS = 800;  // tolerate dropped frames before falling back to setup
+const ACTIVE_MOTION_DEG = 5;     // angle delta that promotes ready → active
 const STOP_IDLE_MS = 6500;
 const MIN_FEEDBACK_REPS = 1;
 const MIN_CLEAN_FEEDBACK_REPS = 2;
@@ -103,25 +103,9 @@ function getRepAngle(metrics) {
   return exercise.repCounter.getAngle(metrics);
 }
 
-function isStartPosition(metrics) {
+function hasValidPose(metrics) {
   if (!exercise?.repCounter) return true;
-  const angle = getRepAngle(metrics);
-  if (angle == null) return false;
-
-  if (typeof exercise.isStartPosition === 'function') {
-    return exercise.isStartPosition(metrics, angle);
-  }
-
-  const { highThreshold, lowThreshold, invert } = exercise.repCounter;
-  return invert ? angle <= lowThreshold + 12 : angle >= highThreshold - 12;
-}
-
-function movedOutOfStart(metrics) {
-  if (!exercise?.repCounter) return true;
-  const angle = getRepAngle(metrics);
-  if (angle == null) return false;
-  const { highThreshold, lowThreshold, invert } = exercise.repCounter;
-  return invert ? angle >= lowThreshold + ACTIVE_EXIT_DEG : angle <= highThreshold - ACTIVE_EXIT_DEG;
+  return getRepAngle(metrics) != null;
 }
 
 function resetSetState(next = 'setup') {
@@ -145,41 +129,52 @@ function resetSetState(next = 'setup') {
 
 function updateSetState(metrics, now) {
   const angle = getRepAngle(metrics);
-  const startReady = isStartPosition(metrics);
+  const poseOk = hasValidPose(metrics);
 
-  if (setState === 'ready' && movedOutOfStart(metrics)) {
-    setState = 'active';
-    activeStartedAt = now;
-    inactiveSince = null;
-    motionRangeMin = angle ?? Infinity;
-    motionRangeMax = angle ?? -Infinity;
-    metricsBuf.frames.length = 0;
-    if (repCounter) {
-      repCounter.reset();
-      repCounter.lockStart(readyMetrics ?? metrics);
-    }
-    return setState;
-  }
-
-  if (setState !== 'active') {
-    if (!startReady) {
+  // Lost the pose: tolerate brief gaps, then fall back to setup.
+  if (!poseOk) {
+    if (setState !== 'setup') {
       startLostAt ??= now;
-      // Keep state stable through short landmark jitter/noise.
-      if (setState === 'ready' && now - startLostAt < START_GRACE_MS) return setState;
-      startHeldAt = null;
-      readyMetrics = null;
-      setState = 'setup';
-      return setState;
+      if (now - startLostAt > POSE_LOST_GRACE_MS) {
+        startHeldAt = null;
+        readyMetrics = null;
+        setState = 'setup';
+      }
     }
+    return setState;
+  }
+  startLostAt = null;
 
-    startLostAt = null;
+  // setup → ready: just confirm the pose stays valid for a brief moment.
+  // We don't gate on a specific extreme — the rep counter auto-anchors on
+  // whichever extreme the user reaches first.
+  if (setState === 'setup') {
     startHeldAt ??= now;
-    setState = now - startHeldAt >= START_HOLD_MS ? 'ready' : 'setup';
-    if (setState === 'ready') readyMetrics = metrics;
-
+    if (now - startHeldAt >= READY_HOLD_MS) {
+      setState = 'ready';
+      readyMetrics = metrics;
+      lastAngle = angle;
+    }
     return setState;
   }
 
+  // ready → active: fire as soon as we see meaningful motion.
+  if (setState === 'ready') {
+    if (lastAngle == null) lastAngle = angle;
+    if (angle != null && Math.abs(angle - lastAngle) >= ACTIVE_MOTION_DEG) {
+      setState = 'active';
+      activeStartedAt = now;
+      inactiveSince = null;
+      motionRangeMin = angle;
+      motionRangeMax = angle;
+      metricsBuf.frames.length = 0;
+      // RepCounter anchors itself on the first observed extreme.
+    }
+    lastAngle = angle ?? lastAngle;
+    return setState;
+  }
+
+  // active: track motion and detect rest/idle.
   if (angle != null) {
     motionRangeMin = Math.min(motionRangeMin, angle);
     motionRangeMax = Math.max(motionRangeMax, angle);
@@ -192,7 +187,7 @@ function updateSetState(metrics, now) {
   }
 
   if (inactiveSince && now - inactiveSince > STOP_IDLE_MS) {
-    resetSetState(isStartPosition(metrics) ? 'ready' : 'setup');
+    resetSetState('ready');
   }
 
   return setState;
@@ -405,14 +400,17 @@ function processFrame(results) {
     metricsBuf.push(metrics);
   }
 
-  // Rep counting only starts after the user holds start position, then moves.
+  // Rep counter auto-anchors on the first extreme it sees, so we just feed it
+  // frames as soon as we're 'active'. No "hold the start position" gate.
   if (currentState === 'active' && repCounter && exercise?.repBased) {
     repCounter.update(metrics, now);
     if (repCounter.count > prevReps) onRepCompleted();
     repCountEl.textContent = repCounter.count;
     phaseEl.textContent = repCounter.phaseName.toUpperCase();
+  } else if (currentState === 'ready') {
+    phaseEl.textContent = (exercise?.startCue ?? 'BEGIN WHEN READY').toUpperCase();
   } else {
-    phaseEl.textContent = currentState === 'ready' ? 'READY' : (exercise?.startCue ?? 'GET IN START POSITION').toUpperCase();
+    phaseEl.textContent = 'STEP INTO FRAME';
   }
 
   // Form analysis
