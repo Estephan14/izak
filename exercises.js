@@ -9,13 +9,16 @@ export const LM = {
   L_ANKLE: 27,    R_ANKLE: 28,
 };
 
-// Angle at joint B using full 3D coordinates (x, y, z) for accuracy across camera angles
+// Angle at joint B in the image plane (2D x/y only). MediaPipe's z is
+// derived by fitting a generic body model and is too noisy for monocular
+// rep-counting — it's the documented failure mode for front-view elbow
+// angles. 2D image-plane angles are what working trackers use.
 export function calcAngle(a, b, c) {
   if (!a || !b || !c) return null;
-  const bax = a.x - b.x, bay = a.y - b.y, baz = (a.z || 0) - (b.z || 0);
-  const bcx = c.x - b.x, bcy = c.y - b.y, bcz = (c.z || 0) - (b.z || 0);
-  const dot = bax * bcx + bay * bcy + baz * bcz;
-  const mag = Math.hypot(bax, bay, baz) * Math.hypot(bcx, bcy, bcz);
+  const bax = a.x - b.x, bay = a.y - b.y;
+  const bcx = c.x - b.x, bcy = c.y - b.y;
+  const dot = bax * bcx + bay * bcy;
+  const mag = Math.hypot(bax, bay) * Math.hypot(bcx, bcy);
   if (mag < 1e-6) return null;
   return Math.acos(Math.max(-1, Math.min(1, dot / mag))) * (180 / Math.PI);
 }
@@ -31,15 +34,31 @@ function ang(lm, i, j, k) {
   return calcAngle(lm[i], lm[j], lm[k]);
 }
 
-// Pick the arm/leg side with the highest visibility — works for front view
-// (both visible, pick whichever is cleaner this frame) and side view (only one
-// side is visible at all). For curls specifically the user usually moves both
-// arms in sync, so either side reflects the rep.
-function bestSide(rightVal, leftVal, rightVis, leftVis) {
-  if (rightVal != null && leftVal != null) {
-    return (rightVis ?? 1) >= (leftVis ?? 1) ? rightVal : leftVal;
-  }
-  return rightVal ?? leftVal;
+// Sticky side picker. Picks an arm/leg side and stays on it across frames
+// — switching only when that side disappears or another side becomes
+// significantly more visible. Frame-to-frame swapping was making the
+// driving angle look like noise (one arm curling, other not), which broke
+// rep detection.
+function makeSidePicker(rightVisKey, leftVisKey) {
+  let lockedSide = null; // 'r' | 'l'
+  return (rightVal, leftVal, m) => {
+    const rVis = m[rightVisKey] ?? 0;
+    const lVis = m[leftVisKey] ?? 0;
+    const rOk = rightVal != null;
+    const lOk = leftVal != null;
+    if (!rOk && !lOk) return null;
+    if (!rOk) { lockedSide = 'l'; return leftVal; }
+    if (!lOk) { lockedSide = 'r'; return rightVal; }
+    if (lockedSide == null) {
+      lockedSide = rVis >= lVis ? 'r' : 'l';
+    } else {
+      // Sticky: only switch if the other side is meaningfully more visible.
+      const other = lockedSide === 'r' ? lVis : rVis;
+      const cur   = lockedSide === 'r' ? rVis : lVis;
+      if (other - cur > 0.15) lockedSide = lockedSide === 'r' ? 'l' : 'r';
+    }
+    return lockedSide === 'r' ? rightVal : leftVal;
+  };
 }
 
 // Extract useful metrics from the 33 MediaPipe landmarks
@@ -92,17 +111,20 @@ export function extractMetrics(lm) {
   };
 }
 
-// View-aware picker for two-arm exercises. Prefers the arm with higher
-// landmark visibility, falls back to whichever side has data.
-function bestElbow(m) {
-  return bestSide(m.rightElbow, m.leftElbow, m.rightArmVis, m.leftArmVis);
-}
-function bestKnee(m) {
-  return bestSide(m.rightKnee, m.leftKnee, m.rightLegVis, m.leftLegVis);
-}
-function bestHipAngle(m) {
-  return bestSide(m.rightHip, m.leftHip, m.rightHipVis, m.leftHipVis);
-}
+// View-aware sticky pickers for two-sided exercises. One stateful picker
+// per metric so left/right doesn't flip-flop frame to frame (which used to
+// inject step-changes into the angle signal and prevent reps from
+// counting). Each call to make…Picker() returns a fresh closure so each
+// RepCounter instance gets its own sticky state.
+function bestElbow(m, picker) { return picker(m.rightElbow, m.leftElbow, m); }
+function bestKnee (m, picker) { return picker(m.rightKnee,  m.leftKnee,  m); }
+function bestHip  (m, picker) { return picker(m.rightHip,   m.leftHip,   m); }
+const elbowPicker = makeSidePicker('rightArmVis', 'leftArmVis');
+const kneePicker  = makeSidePicker('rightLegVis', 'leftLegVis');
+const hipPicker   = makeSidePicker('rightHipVis', 'leftHipVis');
+const pickElbow = m => bestElbow(m, elbowPicker);
+const pickKnee  = m => bestKnee(m,  kneePicker);
+const pickHip   = m => bestHip(m,   hipPicker);
 
 // Rep counter — bidirectional zone-transition counter.
 // Anchors at the first extreme zone reached (top OR bottom), so the user can
@@ -116,19 +138,31 @@ export class RepCounter {
     lowThreshold,
     invert = false,
     minRepRange = null,
-    startTolerance = 8,
-    endTolerance = 7,
+    startTolerance = null,
+    endTolerance = null,
     minRepMs = 450,
   }) {
     this.getAngle = getAngle;
-    this.high = highThreshold;
-    this.low  = lowThreshold;
     this.invert = invert;
-    this.startTolerance = startTolerance;
-    this.endTolerance = endTolerance;
-    this.minRepRange = minRepRange ?? Math.max(26, Math.abs(highThreshold - lowThreshold) * 0.75);
+    this._minRepRangeOverride = minRepRange;
+    this._startToleranceOverride = startTolerance;
+    this._endToleranceOverride = endTolerance;
     this.minRepMs = minRepMs;
+    this.setThresholds(highThreshold, lowThreshold);
     this._init();
+  }
+
+  // Recompute zones / min-range from a (possibly user-calibrated) high/low
+  // pair. Tolerances and minRepRange scale with the working span so a
+  // shorter calibrated ROM still counts properly.
+  setThresholds(high, low) {
+    // The user might capture them in either order — accept either way.
+    this.high = Math.max(high, low);
+    this.low  = Math.min(high, low);
+    const span = Math.abs(this.high - this.low);
+    this.startTolerance = this._startToleranceOverride ?? Math.max(10, span * 0.25);
+    this.endTolerance   = this._endToleranceOverride   ?? Math.max(10, span * 0.25);
+    this.minRepRange    = this._minRepRangeOverride    ?? Math.max(15, span * 0.55);
   }
 
   _init() {
@@ -149,7 +183,7 @@ export class RepCounter {
 
   _smooth(raw) {
     this._buf.push(raw);
-    if (this._buf.length > 4) this._buf.shift();
+    if (this._buf.length > 6) this._buf.shift();
     return this._buf.reduce((s, v) => s + v, 0) / this._buf.length;
   }
 
@@ -295,10 +329,14 @@ export const EXERCISES = {
     category: 'Upper Body',
     repBased: true,
     repCounter: {
-      getAngle: bestElbow,
-      highThreshold: 150, lowThreshold: 80, invert: false, minRepRange: 55, minRepMs: 500,
+      getAngle: pickElbow,
+      highThreshold: 150, lowThreshold: 80, invert: false, minRepMs: 500,
     },
     startCue: 'Pull up to begin counting',
+    calibration: {
+      extendedPrompt: 'Hang from the bar with arms fully extended (dead hang)',
+      contractedPrompt: 'Pull up — chin over the bar, hold',
+    },
     formChecks(m, repCounter) {
       const issues = [];
       const score_base = 100;
@@ -319,10 +357,14 @@ export const EXERCISES = {
     category: 'Upper Body',
     repBased: true,
     repCounter: {
-      getAngle: bestElbow,
-      highThreshold: 150, lowThreshold: 80, invert: false, minRepRange: 55, minRepMs: 500,
+      getAngle: pickElbow,
+      highThreshold: 150, lowThreshold: 80, invert: false, minRepMs: 500,
     },
     startCue: 'Pull up to begin counting',
+    calibration: {
+      extendedPrompt: 'Hang from the bar with arms fully extended (dead hang)',
+      contractedPrompt: 'Pull up — chin over the bar, hold',
+    },
     formChecks(m, repCounter) {
       const issues = [];
       const lr = repCounter?.lastRep;
@@ -341,10 +383,14 @@ export const EXERCISES = {
     category: 'Bodyweight',
     repBased: true,
     repCounter: {
-      getAngle: bestElbow,
-      highThreshold: 155, lowThreshold: 90, invert: false, minRepRange: 50, minRepMs: 450,
+      getAngle: pickElbow,
+      highThreshold: 155, lowThreshold: 90, invert: false, minRepMs: 450,
     },
     startCue: 'Push up to begin counting',
+    calibration: {
+      extendedPrompt: 'Get into top push-up position — arms locked out, plank',
+      contractedPrompt: 'Lower to your bottom position — chest near floor, hold',
+    },
     formChecks(m, repCounter) {
       const issues = [];
       const lr = repCounter?.lastRep;
@@ -364,10 +410,14 @@ export const EXERCISES = {
     category: 'Arms',
     repBased: true,
     repCounter: {
-      getAngle: bestElbow,
-      highThreshold: 155, lowThreshold: 65, invert: false, minRepRange: 70, minRepMs: 420,
+      getAngle: pickElbow,
+      highThreshold: 155, lowThreshold: 65, invert: false, minRepMs: 420,
     },
     startCue: 'Curl to begin counting',
+    calibration: {
+      extendedPrompt: 'Hold the bar at your hips — arms fully straight',
+      contractedPrompt: 'Curl all the way up — bar near shoulders, hold',
+    },
     formChecks(m, repCounter) {
       const issues = [];
       const lr = repCounter?.lastRep;
@@ -386,10 +436,14 @@ export const EXERCISES = {
     category: 'Arms',
     repBased: true,
     repCounter: {
-      getAngle: bestElbow,
-      highThreshold: 155, lowThreshold: 65, invert: false, minRepRange: 70, minRepMs: 420,
+      getAngle: pickElbow,
+      highThreshold: 155, lowThreshold: 65, invert: false, minRepMs: 420,
     },
     startCue: 'Curl to begin counting',
+    calibration: {
+      extendedPrompt: 'Hold the dumbbell at your side — arm fully straight',
+      contractedPrompt: 'Curl all the way up — dumbbell near shoulder, hold',
+    },
     formChecks(m, repCounter) {
       const issues = [];
       const lr = repCounter?.lastRep;
@@ -408,10 +462,14 @@ export const EXERCISES = {
     repBased: true,
     repCounter: {
       // Overhead extension: starts with elbows bent (low angle), extends to high
-      getAngle: bestElbow,
+      getAngle: pickElbow,
       highThreshold: 150, lowThreshold: 80, invert: true,
     },
     startCue: 'Extend overhead to begin counting',
+    calibration: {
+      extendedPrompt: 'Press arms straight overhead — full lockout, hold',
+      contractedPrompt: 'Bend elbows behind head — bottom of the rep, hold',
+    },
     formChecks(m) {
       const issues = [];
       if (m.spineTilt > 28) issues.push('leaning too far back');
@@ -427,10 +485,14 @@ export const EXERCISES = {
     category: 'Legs',
     repBased: true,
     repCounter: {
-      getAngle: bestKnee,
+      getAngle: pickKnee,
       highThreshold: 150, lowThreshold: 105, invert: false,
     },
     startCue: 'Squat to begin counting',
+    calibration: {
+      extendedPrompt: 'Stand tall — knees fully extended, hold',
+      contractedPrompt: 'Squat down to your bottom position — hold',
+    },
     formChecks(m) {
       const issues = [];
       if (m.spineTilt > 42) issues.push('excessive forward lean');
@@ -448,10 +510,14 @@ export const EXERCISES = {
     category: 'Compound',
     repBased: true,
     repCounter: {
-      getAngle: bestHipAngle,
+      getAngle: pickHip,
       highThreshold: 148, lowThreshold: 95, invert: false,
     },
     startCue: 'Stand up to begin counting',
+    calibration: {
+      extendedPrompt: 'Stand tall, fully locked out — hold',
+      contractedPrompt: 'Hinge at hips, bar at floor — bottom position, hold',
+    },
     formChecks(m) {
       const issues = [];
       if (m.spineTilt > 45) issues.push('back rounding — STOP, reset form');
@@ -469,10 +535,14 @@ export const EXERCISES = {
     repBased: true,
     repCounter: {
       // Starts at rack (~80° elbow), extends to lockout (~165°)
-      getAngle: bestElbow,
+      getAngle: pickElbow,
       highThreshold: 145, lowThreshold: 95, invert: true,
     },
     startCue: 'Press up to begin counting',
+    calibration: {
+      extendedPrompt: 'Press the bar straight overhead — full lockout, hold',
+      contractedPrompt: 'Bar at front rack (collarbone) — bottom position, hold',
+    },
     formChecks(m) {
       const issues = [];
       if (m.spineTilt > 30) issues.push('excessive back arch — lower weight');
@@ -488,10 +558,14 @@ export const EXERCISES = {
     category: 'Compound',
     repBased: true,
     repCounter: {
-      getAngle: bestElbow,
+      getAngle: pickElbow,
       highThreshold: 125, lowThreshold: 95, invert: false,
     },
     startCue: 'Press up to begin counting',
+    calibration: {
+      extendedPrompt: 'Press the bar straight up — arms locked out, hold',
+      contractedPrompt: 'Lower the bar to mid-chest — hold at the bottom',
+    },
     formChecks(m) {
       const issues = [];
       if (m.elbowAsymmetry > 22) issues.push('uneven press');

@@ -76,6 +76,7 @@ export default function FitCoachClient() {
 
           <button className="btn-primary" id="save-settings">Save &amp; Close</button>
           <button className="btn-secondary" id="reset-reps">Reset Rep Count</button>
+          <button className="btn-secondary" id="recalibrate-btn">Recalibrate Range of Motion</button>
 
           <p style={{ fontSize: '.72rem', color: '#555', textAlign: 'center', lineHeight: 1.5 }}>
             Keys load from server environment when available.<br />

@@ -46,6 +46,17 @@ const cfg = (() => {
   };
 })();
 
+// ─── Calibration storage (per-exercise, persisted) ───────────────────────────
+const calibStore = {
+  _key(ex) { return `fc_calib_${ex}`; },
+  load(ex) {
+    try { return JSON.parse(localStorage.getItem(this._key(ex)) || 'null'); }
+    catch { return null; }
+  },
+  save(ex, calib) { localStorage.setItem(this._key(ex), JSON.stringify(calib)); },
+  clear(ex) { localStorage.removeItem(this._key(ex)); },
+};
+
 // ─── State ───────────────────────────────────────────────────────────────────
 let poseLandmarker = null;
 let stream         = null;
@@ -59,7 +70,7 @@ let repCounter     = null;
 let exercise       = null;
 let wakeLock       = null;
 let videoMetrics   = { dW: 0, dH: 0, oX: 0, oY: 0 }; // cover-mode draw dimensions
-let setState       = 'setup'; // setup | ready | active
+let setState       = 'setup'; // setup | calibrating | active
 let startHeldAt    = null;
 let startLostAt    = null;
 let readyMetrics   = null;
@@ -68,6 +79,14 @@ let inactiveSince  = null;
 let lastAngle      = null;
 let motionRangeMin = Infinity;
 let motionRangeMax = -Infinity;
+
+// Calibration state
+let calibPhase     = null;   // 'extended' | 'contracted' | null
+let calibSamples   = [];     // smoothed angle samples within current hold
+let calibHoldStartAt = null; // ts when current stable hold began
+let calibCaptured  = { extended: null, contracted: null };
+const CALIB_HOLD_MS = 1500;          // must hold this long
+const CALIB_STABILITY_DEG = 6;       // max range within the hold for it to qualify as "still"
 let lastIssueKey   = '';
 let issueSeenAt    = null;
 let lastFeedbackRep = 0;
@@ -75,9 +94,8 @@ let firstRepFeedbackDone = false;
 let pendingRepFeedback = false;
 let serverConfig = { openrouter: false, elevenlabs: false };
 
-const READY_HOLD_MS = 250;       // brief stable-pose check before going 'ready'
+const READY_HOLD_MS = 250;       // brief stable-pose check before going 'active'
 const POSE_LOST_GRACE_MS = 800;  // tolerate dropped frames before falling back to setup
-const ACTIVE_MOTION_DEG = 5;     // angle delta that promotes ready → active
 const STOP_IDLE_MS = 6500;
 const MIN_FEEDBACK_REPS = 1;
 const MIN_CLEAN_FEEDBACK_REPS = 2;
@@ -125,6 +143,91 @@ function resetSetState(next = 'setup') {
   lastFeedbackRep = 0;
   firstRepFeedbackDone = false;
   pendingRepFeedback = false;
+  calibPhase = null;
+  calibSamples = [];
+  calibHoldStartAt = null;
+  calibCaptured = { extended: null, contracted: null };
+}
+
+// Begin calibration: clear any captured values for this exercise and start
+// at the 'extended' prompt. Called when no saved calibration exists or the
+// user hits "Recalibrate".
+function beginCalibration() {
+  resetSetState('calibrating');
+  calibPhase = 'extended';
+}
+
+// Apply a stored calibration to the active rep counter, transitioning it
+// straight into the active state. Returns false if there's nothing to apply.
+function applyCalibration(calib) {
+  if (!calib || !exercise?.repCounter) return false;
+  if (calib.extended == null || calib.contracted == null) return false;
+  if (!repCounter) return false;
+  repCounter.setThresholds(calib.extended, calib.contracted);
+  return true;
+}
+
+// Calibration capture loop. Called from updateSetState when we're in the
+// 'calibrating' state. Returns the (possibly updated) state.
+function updateCalibration(metrics, now) {
+  const angle = getRepAngle(metrics);
+  if (angle == null) {
+    calibSamples = [];
+    calibHoldStartAt = null;
+    return setState;
+  }
+
+  // Track stability via the rolling sample window.
+  calibSamples.push({ a: angle, t: now });
+  // Drop samples older than the hold window so we measure stability over
+  // the most recent CALIB_HOLD_MS only.
+  while (calibSamples.length && now - calibSamples[0].t > CALIB_HOLD_MS) {
+    calibSamples.shift();
+  }
+
+  const recent = calibSamples.map(s => s.a);
+  const range = recent.length > 1 ? Math.max(...recent) - Math.min(...recent) : 0;
+
+  if (range > CALIB_STABILITY_DEG) {
+    // User is still moving — reset the hold timer.
+    calibHoldStartAt = null;
+    return setState;
+  }
+
+  calibHoldStartAt ??= now;
+  if (now - calibHoldStartAt < CALIB_HOLD_MS) return setState;
+
+  // Capture: average the angles over the stable hold window.
+  const captured = recent.reduce((s, v) => s + v, 0) / recent.length;
+  calibCaptured[calibPhase] = captured;
+  calibSamples = [];
+  calibHoldStartAt = null;
+
+  if (calibPhase === 'extended') {
+    calibPhase = 'contracted';
+    return setState;
+  }
+
+  // Both captured — persist, apply, and transition to active.
+  const exKey = cfg.get('exercise');
+  const calib = {
+    extended: calibCaptured.extended,
+    contracted: calibCaptured.contracted,
+    capturedAt: Date.now(),
+  };
+  calibStore.save(exKey, calib);
+  applyCalibration(calib);
+
+  setState = 'active';
+  activeStartedAt = now;
+  inactiveSince = null;
+  motionRangeMin = angle;
+  motionRangeMax = angle;
+  metricsBuf.frames.length = 0;
+  lastAngle = angle;
+  calibPhase = null;
+  if (feedbackEl) feedbackEl.textContent = '';
+  return setState;
 }
 
 function updateSetState(metrics, now) {
@@ -145,33 +248,41 @@ function updateSetState(metrics, now) {
   }
   startLostAt = null;
 
-  // setup → ready: just confirm the pose stays valid for a brief moment.
-  // We don't gate on a specific extreme — the rep counter auto-anchors on
-  // whichever extreme the user reaches first.
+  // setup → calibrating | active. If the user has a saved calibration for
+  // this exercise we skip straight to active. Otherwise we walk them
+  // through capturing their personal extended + contracted positions so
+  // the rep counter's thresholds match this user, this camera angle.
   if (setState === 'setup') {
     startHeldAt ??= now;
     if (now - startHeldAt >= READY_HOLD_MS) {
-      setState = 'ready';
-      readyMetrics = metrics;
-      lastAngle = angle;
+      const exKey = cfg.get('exercise');
+      const supportsCalibration = !!exercise?.calibration && !!exercise?.repBased;
+      const saved = supportsCalibration ? calibStore.load(exKey) : null;
+      if (saved && applyCalibration(saved)) {
+        setState = 'active';
+        activeStartedAt = now;
+        inactiveSince = null;
+        motionRangeMin = angle;
+        motionRangeMax = angle;
+        metricsBuf.frames.length = 0;
+        lastAngle = angle;
+      } else if (supportsCalibration) {
+        beginCalibration();
+      } else {
+        setState = 'active';
+        activeStartedAt = now;
+        inactiveSince = null;
+        motionRangeMin = angle;
+        motionRangeMax = angle;
+        metricsBuf.frames.length = 0;
+        lastAngle = angle;
+      }
     }
     return setState;
   }
 
-  // ready → active: fire as soon as we see meaningful motion.
-  if (setState === 'ready') {
-    if (lastAngle == null) lastAngle = angle;
-    if (angle != null && Math.abs(angle - lastAngle) >= ACTIVE_MOTION_DEG) {
-      setState = 'active';
-      activeStartedAt = now;
-      inactiveSince = null;
-      motionRangeMin = angle;
-      motionRangeMax = angle;
-      metricsBuf.frames.length = 0;
-      // RepCounter anchors itself on the first observed extreme.
-    }
-    lastAngle = angle ?? lastAngle;
-    return setState;
+  if (setState === 'calibrating') {
+    return updateCalibration(metrics, now);
   }
 
   // active: track motion and detect rest/idle.
@@ -187,7 +298,7 @@ function updateSetState(metrics, now) {
   }
 
   if (inactiveSince && now - inactiveSince > STOP_IDLE_MS) {
-    resetSetState('ready');
+    resetSetState('setup');
   }
 
   return setState;
@@ -203,7 +314,8 @@ function issueKey(form) {
 }
 
 function shouldAskForFeedback(form, now) {
-  if (llmInFlight || (!cfg.get('openrouterKey') && !serverConfig.openrouter) || setState !== 'active') return false;
+  if (llmInFlight || (!cfg.get('openrouterKey') && !serverConfig.openrouter)) return false;
+  if (setState !== 'active') return false;
 
   const reps = repCounter?.count ?? 0;
   const fi = repCounter?.getFailureIndicators();
@@ -407,8 +519,8 @@ function processFrame(results) {
     if (repCounter.count > prevReps) onRepCompleted();
     repCountEl.textContent = repCounter.count;
     phaseEl.textContent = repCounter.phaseName.toUpperCase();
-  } else if (currentState === 'ready') {
-    phaseEl.textContent = (exercise?.startCue ?? 'BEGIN WHEN READY').toUpperCase();
+  } else if (currentState === 'calibrating') {
+    renderCalibrationPrompt(now);
   } else {
     phaseEl.textContent = 'STEP INTO FRAME';
   }
@@ -429,8 +541,10 @@ function processFrame(results) {
   // Form score/status
   if (currentState === 'active') {
     setStatusText('FORM ' + form.score + '%', scoreToColor(form.score));
+  } else if (currentState === 'calibrating') {
+    setStatusText('CALIBRATING', '#ffb800');
   } else {
-    setStatusText(currentState === 'ready' ? 'READY' : 'SETUP', currentState === 'ready' ? '#00d4aa' : '#888');
+    setStatusText('SETUP', '#888');
   }
 
   if (shouldAskForFeedback(form, now)) {
@@ -440,6 +554,25 @@ function processFrame(results) {
     pendingRepFeedback = false;
     callLLM(false, form);
   }
+}
+
+function renderCalibrationPrompt(now) {
+  const c = exercise?.calibration;
+  if (!c || !calibPhase) {
+    phaseEl.textContent = 'CALIBRATING';
+    return;
+  }
+  const which = calibPhase === 'extended' ? '1/2' : '2/2';
+  const prompt = calibPhase === 'extended' ? c.extendedPrompt : c.contractedPrompt;
+  const holding = calibHoldStartAt != null;
+  let progress = 0;
+  if (holding) progress = Math.min(1, (now - calibHoldStartAt) / CALIB_HOLD_MS);
+  const bar = '█'.repeat(Math.round(progress * 10)) + '░'.repeat(10 - Math.round(progress * 10));
+  const status = holding
+    ? `HOLDING… ${bar}`
+    : 'GET INTO POSITION & HOLD STILL';
+  phaseEl.textContent = `CALIBRATE ${which}: ${status}`;
+  feedbackEl.textContent = prompt;
 }
 
 function drawHint(msg) {
@@ -535,6 +668,13 @@ function applyExercise(key) {
   exNameEl.textContent = exercise.name;
   repCountEl.textContent = '0';
   phaseEl.textContent = '';
+  // Apply any persisted calibration up-front so the rep counter starts with
+  // the user's personal thresholds (if they've calibrated this exercise
+  // before). If not, calibration runs on next session start.
+  if (repCounter) {
+    const saved = calibStore.load(key);
+    if (saved) applyCalibration(saved);
+  }
   resetSetState('setup');
 }
 
@@ -600,8 +740,24 @@ on(saveSettings, 'click', () => {
 });
 
 on(resetReps, 'click', () => {
-  resetSetState(setState === 'active' ? 'ready' : setState);
+  resetSetState(setState === 'active' ? 'setup' : setState);
   repCountEl.textContent = '0';
+});
+
+on($('recalibrate-btn'), 'click', () => {
+  const exKey = cfg.get('exercise');
+  calibStore.clear(exKey);
+  // If the rep counter has cached personal thresholds, reset them back to the
+  // exercise defaults so the next active state runs calibration from scratch.
+  if (repCounter && exercise?.repCounter) {
+    repCounter.setThresholds(exercise.repCounter.highThreshold, exercise.repCounter.lowThreshold);
+  }
+  if (running) {
+    beginCalibration();
+  } else {
+    resetSetState('setup');
+  }
+  closeSettingsPanel();
 });
 
 // Swipe right to close settings on mobile
