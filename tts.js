@@ -1,5 +1,5 @@
 // ElevenLabs TTS client — one utterance at a time, skips if busy
-const DEFAULT_VOICE = 'pNInz6obpgDQGcFmaJgB'; // Adam (energetic male)
+const DEFAULT_VOICE = 'ErXwobaYiN019PkySvjV'; // Antoni (deeper male, closer to Arnold-style)
 
 class TTSClient {
   constructor() {
@@ -12,7 +12,7 @@ class TTSClient {
   }
 
   async speak(text, { urgent = false } = {}) {
-    if (!this.enabled || !this.apiKey || !text?.trim()) return;
+    if (!this.enabled || !text?.trim()) return;
 
     if (urgent) {
       this._stop();
@@ -32,16 +32,21 @@ class TTSClient {
     this._busy = true;
 
     try {
+      const useProxy = !this.apiKey;
       const res = await fetch(
-        `https://api.elevenlabs.io/v1/text-to-speech/${this.voiceId || DEFAULT_VOICE}`,
+        useProxy ? '/api/tts' : `https://api.elevenlabs.io/v1/text-to-speech/${this.voiceId || DEFAULT_VOICE}`,
         {
           method: 'POST',
-          headers: { 'xi-api-key': this.apiKey, 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            text,
-            model_id: 'eleven_flash_v2_5',
-            voice_settings: { stability: 0.5, similarity_boost: 0.75, speed: 1.1 },
-          }),
+          headers: useProxy
+            ? { 'Content-Type': 'application/json' }
+            : { 'xi-api-key': this.apiKey, 'Content-Type': 'application/json' },
+          body: JSON.stringify(useProxy
+            ? { text, voiceId: this.voiceId || DEFAULT_VOICE }
+            : {
+              text,
+              model_id: 'eleven_flash_v2_5',
+              voice_settings: { stability: 0.5, similarity_boost: 0.75, speed: 1.1 },
+            }),
         }
       );
 

@@ -1,30 +1,37 @@
 // OpenRouter streaming client + prompt builder
 
-const SYSTEM_PROMPT = `You are an elite fitness and sports coach AI. You receive real-time pose joint-angle data from a phone camera and give ONE brief coaching cue.
+// Sonnet is intentionally used here for better judgment on noisy pose data.
+export const MODEL = 'anthropic/claude-sonnet-4.5';
 
-Rules:
-- Max 20 words
-- Present tense, active voice ("Keep your...", "Drive those...", "Lock out...")
-- Focus on the single most critical form issue
-- If form is great, give a power-up ("Beautiful form, push through!")
-- If near failure, be urgent ("Don't stop — one more rep in you!")
-- No greetings, no explanations — just the cue`;
+const SYSTEM_PROMPT = `You are a real-time fitness coach watching someone work out via a phone camera.
 
-export async function* streamCompletion(messages, model, apiKey) {
-  const res = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+STRICT RULES:
+1. Reply with ONE sentence, max 12 words.
+2. The "Allowed cues" line is the source of truth.
+3. If allowed cues are listed, choose one and use nearly the same wording.
+4. Do NOT mention core, hips, breathing, bracing, balance, depth, or tempo unless those exact words appear in Allowed cues.
+5. If "Allowed cues: NONE" give a neutral rep-count cue ("Rep logged.", "Good rep.").
+6. If near failure be urgent ("One more, give it everything!").
+7. No greetings, no prefixes, no explanations. Just the cue.`;
+
+export async function* streamCompletion(messages, apiKey) {
+  const useProxy = !apiKey;
+  const res = await fetch(useProxy ? '/api/openrouter' : 'https://openrouter.ai/api/v1/chat/completions', {
     method: 'POST',
     headers: {
-      Authorization: `Bearer ${apiKey}`,
+      ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),
       'Content-Type': 'application/json',
-      'HTTP-Referer': typeof window !== 'undefined' ? window.location.origin : 'https://fitcoach.ai',
-      'X-Title': 'FitCoach AI',
+      ...(apiKey ? {
+        'HTTP-Referer': typeof window !== 'undefined' ? window.location.origin : 'https://fitcoach.ai',
+        'X-Title': 'FitCoach AI',
+      } : {}),
     },
     body: JSON.stringify({
-      model,
+      model: MODEL,
       messages,
       stream: true,
-      max_tokens: 60,
-      temperature: 0.8,
+      max_tokens: 40,
+      temperature: 0.4,
     }),
   });
 
@@ -55,35 +62,66 @@ export async function* streamCompletion(messages, model, apiKey) {
   }
 }
 
-export function buildPrompt(exercise, metrics, repCount, failureInfo, phase) {
+export function buildPrompt(exercise, metrics, repCount, failureInfo, phase, formSnapshot = null) {
   const m = metrics;
   const parts = [];
 
-  if (m.rightElbow != null) parts.push(`R.Elbow: ${Math.round(m.rightElbow)}°`);
-  if (m.leftElbow != null)  parts.push(`L.Elbow: ${Math.round(m.leftElbow)}°`);
-  if (m.rightKnee != null)  parts.push(`R.Knee: ${Math.round(m.rightKnee)}°`);
-  if (m.leftKnee != null)   parts.push(`L.Knee: ${Math.round(m.leftKnee)}°`);
-  if (m.rightShoulder != null) parts.push(`R.Shoulder: ${Math.round(m.rightShoulder)}°`);
-  if (m.leftShoulder != null)  parts.push(`L.Shoulder: ${Math.round(m.leftShoulder)}°`);
-  if (m.rightHip != null)   parts.push(`R.Hip: ${Math.round(m.rightHip)}°`);
-  if (m.spineTilt != null)  parts.push(`Spine tilt: ${Math.round(m.spineTilt)}°`);
-  if (m.hipTilt != null)    parts.push(`Hip sway: ${m.hipTilt.toFixed(1)}%`);
-  if (m.elbowAsymmetry != null) parts.push(`Arm diff: ${Math.round(m.elbowAsymmetry)}°`);
+  if (m.rightElbow     != null) parts.push(`R.Elbow: ${Math.round(m.rightElbow)} deg`);
+  if (m.leftElbow      != null) parts.push(`L.Elbow: ${Math.round(m.leftElbow)} deg`);
+  if (m.rightKnee      != null) parts.push(`R.Knee: ${Math.round(m.rightKnee)} deg`);
+  if (m.leftKnee       != null) parts.push(`L.Knee: ${Math.round(m.leftKnee)} deg`);
+  if (m.rightShoulder  != null) parts.push(`R.Shoulder: ${Math.round(m.rightShoulder)} deg`);
+  if (m.rightHip       != null) parts.push(`R.Hip: ${Math.round(m.rightHip)} deg`);
+  if (m.spineTilt      != null) parts.push(`Spine tilt: ${Math.round(m.spineTilt)} deg`);
+  if (m.hipTilt        != null) parts.push(`Hip sway: ${m.hipTilt.toFixed(1)}%`);
+  if (m.elbowAsymmetry != null) parts.push(`Arm diff: ${Math.round(m.elbowAsymmetry)} deg`);
 
-  const issues = exercise.formChecks(m).issues;
+  const form = formSnapshot ?? exercise.formChecks(m);
+  const issues = form.issues;
+  const score = form.score;
+
+  const issuesLine = issues.length ? issues.join(', ') : 'NONE';
+  const allowedCues = buildAllowedCues(issues);
+  const cuesLine = allowedCues.length ? allowedCues.join(' | ') : 'NONE';
   const failureLine = failureInfo?.isNearFailure
-    ? `\n⚠ NEAR FAILURE — speed +${Math.round((failureInfo.slowingFactor - 1) * 100)}%, ROM -${Math.round(failureInfo.rangeLoss * 100)}%`
+    ? `\nNEAR FAILURE: reps slowing ${Math.round((failureInfo.slowingFactor - 1) * 100)}%, ROM dropping ${Math.round(failureInfo.rangeLoss * 100)}%`
     : '';
 
-  const userContent = [
-    `${exercise.name}${repCount > 0 ? ` | Rep #${repCount}` : ''}${phase ? ` | phase: ${phase}` : ''}`,
-    `\nAngles:\n${parts.map(p => `- ${p}`).join('\n')}`,
-    issues.length ? `\nDetected issues: ${issues.join(', ')}` : '',
-    failureLine,
-  ].join('');
+  const userContent =
+`${exercise.name}${repCount > 0 ? ` | Rep #${repCount}` : ''}${phase ? ` | ${phase}` : ''}
+Form score: ${score}/100
+Detected issues: ${issuesLine}
+Allowed cues: ${cuesLine}${failureLine}
+
+Angles:
+${parts.map(p => `- ${p}`).join('\n')}`;
 
   return [
-    { role: 'system', content: `${SYSTEM_PROMPT}\n\nExercise context: ${exercise.coachingContext}` },
+    { role: 'system', content: `${SYSTEM_PROMPT}\n\nExercise: ${exercise.coachingContext}` },
     { role: 'user', content: userContent },
   ];
+}
+
+function buildAllowedCues(issues) {
+  const cues = [];
+  for (const issue of issues) {
+    const text = issue.toLowerCase();
+    if (/incomplete arm extension/.test(text)) cues.push('Reach full arm extension before the next rep.');
+    else if (/incomplete lockout/.test(text)) cues.push('Lock out fully at the top.');
+    else if (/not high enough at top/.test(text)) cues.push('Pull higher before lowering.');
+    else if (/not curled high enough/.test(text)) cues.push('Curl higher before lowering.');
+    else if (/not low enough/.test(text)) cues.push('Lower closer to full depth.');
+    else if (/arm imbalance|uneven curl|uneven press|uneven push|uneven extension/.test(text)) cues.push('Even out left and right side.');
+    else if (/torso swinging|swinging|body swing|momentum/.test(text)) cues.push('Reduce swing before the next rep.');
+    else if (/excessive lean|forward lean/.test(text)) cues.push('Bring your chest more upright.');
+    else if (/hips not aligned|hip rotation|hip shift/.test(text)) cues.push('Keep your body line steady.');
+    else if (/uneven depth/.test(text)) cues.push('Match depth on both sides.');
+    else if (/back rounding/.test(text)) cues.push('Stop and reset your back position.');
+    else if (/too much knee bend/.test(text)) cues.push('Use a smaller knee bend.');
+    else if (/bend your knees/.test(text)) cues.push('Add a small knee bend.');
+    else if (/extend fully/.test(text)) cues.push('Finish the extension fully.');
+    else if (/guide hand/.test(text)) cues.push('Release with only the shooting hand.');
+    else if (/off-balance/.test(text)) cues.push('Center your weight before release.');
+  }
+  return [...new Set(cues)].slice(0, 2);
 }

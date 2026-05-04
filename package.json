@@ -3,7 +3,14 @@
   "version": "1.0.0",
   "description": "AI basketball & weightlifting coach using MediaPipe, OpenRouter LLM, and ElevenLabs TTS",
   "scripts": {
-    "dev": "npx serve -l 8080 .",
-    "serve": "npx http-server -p 8080 --cors ."
-  }
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start"
+  },
+  "dependencies": {
+    "next": "^15.3.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
+  },
+  "devDependencies": {}
 }

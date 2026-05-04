@@ -1,13 +1,15 @@
-import {
-  PoseLandmarker,
-  FilesetResolver,
-} from 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/+esm';
 import { EXERCISES, EXERCISE_GROUPS, extractMetrics, RepCounter } from './exercises.js';
 import { streamCompletion, buildPrompt } from './llm.js';
 import tts from './tts.js';
 
+let PoseLandmarker = null;
+let FilesetResolver = null;
+
 // ─── DOM refs ────────────────────────────────────────────────────────────────
 const $  = id => document.getElementById(id);
+const on = (el, event, handler, opts) => {
+  if (el) el.addEventListener(event, handler, opts);
+};
 const video         = $('video');
 const canvas        = $('canvas');
 const ctx           = canvas.getContext('2d');
@@ -26,15 +28,12 @@ const saveSettings  = $('save-settings');
 const resetReps     = $('reset-reps');
 const loadingOv     = $('loading-overlay');
 const loadingMsg    = $('loading-msg');
-const intervalSlider = $('feedback-interval');
-const intervalVal    = $('interval-val');
 
 // ─── Config (localStorage) ───────────────────────────────────────────────────
 const cfg = (() => {
   const defaults = {
     openrouterKey: '', elevenLabsKey: '', elevenLabsVoice: '',
-    model: 'google/gemini-flash-1.5', exercise: 'pullup',
-    voiceEnabled: true, feedbackInterval: 4,
+    exercise: 'pullup', voiceEnabled: true,
   };
   let data = { ...defaults };
   return {
@@ -60,6 +59,32 @@ let repCounter     = null;
 let exercise       = null;
 let wakeLock       = null;
 let videoMetrics   = { dW: 0, dH: 0, oX: 0, oY: 0 }; // cover-mode draw dimensions
+let setState       = 'setup'; // setup | ready | active
+let startHeldAt    = null;
+let startLostAt    = null;
+let readyMetrics   = null;
+let activeStartedAt = null;
+let inactiveSince  = null;
+let lastAngle      = null;
+let motionRangeMin = Infinity;
+let motionRangeMax = -Infinity;
+let lastIssueKey   = '';
+let issueSeenAt    = null;
+let lastFeedbackRep = 0;
+let firstRepFeedbackDone = false;
+let pendingRepFeedback = false;
+let serverConfig = { openrouter: false, elevenlabs: false };
+
+const START_HOLD_MS = 1000;
+const START_GRACE_MS = 450;
+const ACTIVE_EXIT_DEG = 25;
+const STOP_IDLE_MS = 6500;
+const MIN_FEEDBACK_REPS = 1;
+const MIN_CLEAN_FEEDBACK_REPS = 2;
+const FIRST_REP_DELAY_MS = 900;
+const ISSUE_PERSIST_MS = 1400;
+const ISSUE_COOLDOWN_MS = 9000;
+const CLEAN_COOLDOWN_REPS = 4;
 
 // Sliding metric buffer (avg before sending to LLM)
 const metricsBuf = { frames: [], push(m) { this.frames.push(m); if (this.frames.length > 30) this.frames.shift(); }, avg() {
@@ -73,10 +98,150 @@ const metricsBuf = { frames: [], push(m) { this.frames.push(m); if (this.frames.
   return out;
 } };
 
+function getRepAngle(metrics) {
+  if (!exercise?.repCounter) return null;
+  return exercise.repCounter.getAngle(metrics);
+}
+
+function isStartPosition(metrics) {
+  if (!exercise?.repCounter) return true;
+  const angle = getRepAngle(metrics);
+  if (angle == null) return false;
+
+  if (typeof exercise.isStartPosition === 'function') {
+    return exercise.isStartPosition(metrics, angle);
+  }
+
+  const { highThreshold, lowThreshold, invert } = exercise.repCounter;
+  return invert ? angle <= lowThreshold + 12 : angle >= highThreshold - 12;
+}
+
+function movedOutOfStart(metrics) {
+  if (!exercise?.repCounter) return true;
+  const angle = getRepAngle(metrics);
+  if (angle == null) return false;
+  const { highThreshold, lowThreshold, invert } = exercise.repCounter;
+  return invert ? angle >= lowThreshold + ACTIVE_EXIT_DEG : angle <= highThreshold - ACTIVE_EXIT_DEG;
+}
+
+function resetSetState(next = 'setup') {
+  setState = next;
+  startHeldAt = null;
+  startLostAt = null;
+  readyMetrics = null;
+  activeStartedAt = null;
+  inactiveSince = null;
+  lastAngle = null;
+  motionRangeMin = Infinity;
+  motionRangeMax = -Infinity;
+  metricsBuf.frames.length = 0;
+  if (repCounter) repCounter.reset();
+  lastIssueKey = '';
+  issueSeenAt = null;
+  lastFeedbackRep = 0;
+  firstRepFeedbackDone = false;
+  pendingRepFeedback = false;
+}
+
+function updateSetState(metrics, now) {
+  const angle = getRepAngle(metrics);
+  const startReady = isStartPosition(metrics);
+
+  if (setState === 'ready' && movedOutOfStart(metrics)) {
+    setState = 'active';
+    activeStartedAt = now;
+    inactiveSince = null;
+    motionRangeMin = angle ?? Infinity;
+    motionRangeMax = angle ?? -Infinity;
+    metricsBuf.frames.length = 0;
+    if (repCounter) {
+      repCounter.reset();
+      repCounter.lockStart(readyMetrics ?? metrics);
+    }
+    return setState;
+  }
+
+  if (setState !== 'active') {
+    if (!startReady) {
+      startLostAt ??= now;
+      // Keep state stable through short landmark jitter/noise.
+      if (setState === 'ready' && now - startLostAt < START_GRACE_MS) return setState;
+      startHeldAt = null;
+      readyMetrics = null;
+      setState = 'setup';
+      return setState;
+    }
+
+    startLostAt = null;
+    startHeldAt ??= now;
+    setState = now - startHeldAt >= START_HOLD_MS ? 'ready' : 'setup';
+    if (setState === 'ready') readyMetrics = metrics;
+
+    return setState;
+  }
+
+  if (angle != null) {
+    motionRangeMin = Math.min(motionRangeMin, angle);
+    motionRangeMax = Math.max(motionRangeMax, angle);
+    const delta = lastAngle == null ? 0 : Math.abs(angle - lastAngle);
+    lastAngle = angle;
+
+    const meaningfulRange = motionRangeMax - motionRangeMin >= 10;
+    if (delta > 0.8 || meaningfulRange) inactiveSince = null;
+    else inactiveSince ??= now;
+  }
+
+  if (inactiveSince && now - inactiveSince > STOP_IDLE_MS) {
+    resetSetState(isStartPosition(metrics) ? 'ready' : 'setup');
+  }
+
+  return setState;
+}
+
+function setStatusText(text, color = '#888') {
+  formScoreEl.textContent = text;
+  formScoreEl.style.color = color;
+}
+
+function issueKey(form) {
+  return form.issues?.length ? form.issues.join('|') : 'NONE';
+}
+
+function shouldAskForFeedback(form, now) {
+  if (llmInFlight || (!cfg.get('openrouterKey') && !serverConfig.openrouter) || setState !== 'active') return false;
+
+  const reps = repCounter?.count ?? 0;
+  const fi = repCounter?.getFailureIndicators();
+  if (fi?.isNearFailure && reps > lastFeedbackRep) return true;
+  if (exercise?.repBased && reps < MIN_FEEDBACK_REPS) return false;
+
+  const key = issueKey(form);
+  if (key !== lastIssueKey) {
+    lastIssueKey = key;
+    issueSeenAt = now;
+    return false;
+  }
+
+  if (key !== 'NONE') {
+    return now - issueSeenAt > ISSUE_PERSIST_MS && now - lastLLMCall > ISSUE_COOLDOWN_MS;
+  }
+
+  if (pendingRepFeedback && !firstRepFeedbackDone && reps >= MIN_CLEAN_FEEDBACK_REPS && now - activeStartedAt > FIRST_REP_DELAY_MS) {
+    return true;
+  }
+
+  return pendingRepFeedback && reps >= lastFeedbackRep + CLEAN_COOLDOWN_REPS && now - lastLLMCall > ISSUE_COOLDOWN_MS;
+}
+
 // ─── MediaPipe init ──────────────────────────────────────────────────────────
 async function initPose() {
   setLoading('Loading AI model...');
   try {
+    if (!PoseLandmarker || !FilesetResolver) {
+      ({ PoseLandmarker, FilesetResolver } = await import(
+        /* webpackIgnore: true */ 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/+esm'
+      ));
+    }
     const vision = await FilesetResolver.forVisionTasks(
       'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm'
     );
@@ -103,8 +268,13 @@ async function initPose() {
 async function startCamera() {
   if (stream) stream.getTracks().forEach(t => t.stop());
   try {
+    const constraints = {
+      width: { ideal: 1280 },
+      height: { ideal: 720 },
+    };
+    if (!flipBtn.classList.contains('hidden')) constraints.facingMode = facingMode;
     stream = await navigator.mediaDevices.getUserMedia({
-      video: { facingMode, width: { ideal: 1280 }, height: { ideal: 720 } },
+      video: constraints,
       audio: false,
     });
     video.srcObject = stream;
@@ -114,6 +284,15 @@ async function startCamera() {
     console.error('[camera]', e);
     return false;
   }
+}
+
+async function updateCameraControls() {
+  try {
+    if (!navigator.mediaDevices?.enumerateDevices) return;
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    const cameras = devices.filter(d => d.kind === 'videoinput');
+    flipBtn.classList.toggle('hidden', cameras.length < 2);
+  } catch {}
 }
 
 // ─── Render loop ─────────────────────────────────────────────────────────────
@@ -218,19 +397,26 @@ function processFrame(results) {
 
   const lms = results.landmarks[0];
   const metrics = extractMetrics(lms);
-  metricsBuf.push(metrics);
+  const now = performance.now();
+  const currentState = updateSetState(metrics, now);
 
-  // Rep counting
   const prevReps = repCounter?.count ?? 0;
-  if (repCounter && exercise?.repBased) {
-    repCounter.update(metrics, performance.now());
+  if (currentState === 'active') {
+    metricsBuf.push(metrics);
+  }
+
+  // Rep counting only starts after the user holds start position, then moves.
+  if (currentState === 'active' && repCounter && exercise?.repBased) {
+    repCounter.update(metrics, now);
     if (repCounter.count > prevReps) onRepCompleted();
     repCountEl.textContent = repCounter.count;
     phaseEl.textContent = repCounter.phaseName.toUpperCase();
+  } else {
+    phaseEl.textContent = currentState === 'ready' ? 'READY' : (exercise?.startCue ?? 'GET IN START POSITION').toUpperCase();
   }
 
   // Form analysis
-  const form = exercise?.formChecks(metrics) ?? { issues: [], score: 80 };
+  const form = exercise?.formChecks(metrics, repCounter) ?? { issues: [], score: 80 };
 
   // Draw skeleton
   drawSkeleton(lms, scoreToColor(form.score));
@@ -242,16 +428,19 @@ function processFrame(results) {
   drawAngleLabel(lms[26], metrics.rightKnee,  form.issues.every(i => !/knee/i.test(i)));
   drawAngleLabel(lms[12], metrics.rightShoulder, true);
 
-  // Form score
-  formScoreEl.textContent = form.score + '%';
-  formScoreEl.style.color = scoreToColor(form.score);
+  // Form score/status
+  if (currentState === 'active') {
+    setStatusText('FORM ' + form.score + '%', scoreToColor(form.score));
+  } else {
+    setStatusText(currentState === 'ready' ? 'READY' : 'SETUP', currentState === 'ready' ? '#00d4aa' : '#888');
+  }
 
-  // LLM call throttle
-  const now = performance.now();
-  const interval = cfg.get('feedbackInterval') * 1000;
-  if (!llmInFlight && cfg.get('openrouterKey') && (now - lastLLMCall) > interval) {
+  if (shouldAskForFeedback(form, now)) {
     lastLLMCall = now;
-    callLLM(false);
+    lastFeedbackRep = repCounter?.count ?? 0;
+    if (!form.issues.length) firstRepFeedbackDone = true;
+    pendingRepFeedback = false;
+    callLLM(false, form);
   }
 }
 
@@ -266,23 +455,23 @@ function drawHint(msg) {
 }
 
 // ─── LLM ─────────────────────────────────────────────────────────────────────
-async function callLLM(urgent) {
+async function callLLM(urgent, formSnapshot = null) {
   const avg = metricsBuf.avg();
   if (!avg || !exercise) return;
   llmInFlight = true;
   statusDot.className = 'thinking';
 
   const failInfo = repCounter?.getFailureIndicators();
-  const msgs = buildPrompt(exercise, avg, repCounter?.count ?? 0, failInfo, repCounter?.phaseName);
+  const msgs = buildPrompt(exercise, avg, repCounter?.count ?? 0, failInfo, repCounter?.phaseName, formSnapshot);
 
   feedbackEl.textContent = '';
   let full = '';
   try {
-    for await (const chunk of streamCompletion(msgs, cfg.get('model'), cfg.get('openrouterKey'))) {
+    for await (const chunk of streamCompletion(msgs, cfg.get('openrouterKey'))) {
       full += chunk;
       feedbackEl.textContent = full;
     }
-    if (cfg.get('voiceEnabled') && cfg.get('elevenLabsKey') && full.trim()) {
+    if (cfg.get('voiceEnabled') && (cfg.get('elevenLabsKey') || serverConfig.elevenlabs) && full.trim()) {
       tts.apiKey   = cfg.get('elevenLabsKey');
       tts.voiceId  = cfg.get('elevenLabsVoice') || undefined;
       tts.speak(full, { urgent });
@@ -296,6 +485,7 @@ async function callLLM(urgent) {
 }
 
 function onRepCompleted() {
+  pendingRepFeedback = true;
   // Flash rep counter
   repCountEl.style.transform = 'scale(1.4)';
   setTimeout(() => { repCountEl.style.transform = ''; }, 200);
@@ -304,6 +494,7 @@ function onRepCompleted() {
   if (fi?.isNearFailure) {
     callLLM(true); // urgent TTS
     lastLLMCall = performance.now();
+    lastFeedbackRep = repCounter?.count ?? 0;
   }
 }
 
@@ -312,12 +503,14 @@ async function startSession() {
   if (running) return;
   const ok = await startCamera();
   if (!ok) { alert('Camera access denied. Please allow camera access.'); return; }
+  updateCameraControls();
   running = true;
+  resetSetState('setup');
   metricsBuf.frames.length = 0;
   lastLLMCall = 0;
   requestWakeLock();
   renderLoop();
-  startBtn.textContent = '⏹';
+  startBtn.textContent = 'STOP';
   startBtn.classList.add('active');
   statusDot.className = 'active';
 }
@@ -329,10 +522,11 @@ function stopSession() {
   tts.stop();
   releaseWakeLock();
   ctx.clearRect(0, 0, canvas.width, canvas.height);
-  startBtn.textContent = '▶';
+  startBtn.textContent = 'GO';
   startBtn.classList.remove('active');
   statusDot.className = '';
   phaseEl.textContent = '';
+  setStatusText('-', '#888');
 }
 
 // ─── Exercise setup ──────────────────────────────────────────────────────────
@@ -343,7 +537,7 @@ function applyExercise(key) {
   exNameEl.textContent = exercise.name;
   repCountEl.textContent = '0';
   phaseEl.textContent = '';
-  metricsBuf.frames.length = 0;
+  resetSetState('setup');
 }
 
 // ─── Wake lock ────────────────────────────────────────────────────────────────
@@ -377,34 +571,29 @@ function openSettings() {
   $('inp-or-key').value   = cfg.get('openrouterKey')   || '';
   $('inp-el-key').value   = cfg.get('elevenLabsKey')   || '';
   $('inp-el-voice').value = cfg.get('elevenLabsVoice') || '';
-  $('model-select').value = cfg.get('model');
   $('exercise-select').value = cfg.get('exercise');
   $('voice-toggle').checked  = cfg.get('voiceEnabled');
-  intervalSlider.value = cfg.get('feedbackInterval');
-  intervalVal.textContent = intervalSlider.value + 's';
   settingsPanel.classList.add('visible');
 }
 
 function closeSettingsPanel() { settingsPanel.classList.remove('visible'); }
 
 // ─── UI bindings ─────────────────────────────────────────────────────────────
-startBtn.addEventListener('click', () => { running ? stopSession() : startSession(); });
+on(startBtn, 'click', () => { running ? stopSession() : startSession(); });
 
-flipBtn.addEventListener('click', () => {
+on(flipBtn, 'click', () => {
   facingMode = facingMode === 'environment' ? 'user' : 'environment';
   if (running) { stopSession(); startSession(); }
 });
 
-settingsBtn.addEventListener('click', openSettings);
-closeSettings.addEventListener('click', closeSettingsPanel);
+on(settingsBtn, 'click', openSettings);
+on(closeSettings, 'click', closeSettingsPanel);
 
-saveSettings.addEventListener('click', () => {
+on(saveSettings, 'click', () => {
   cfg.set('openrouterKey',   $('inp-or-key').value.trim());
   cfg.set('elevenLabsKey',   $('inp-el-key').value.trim());
   cfg.set('elevenLabsVoice', $('inp-el-voice').value.trim());
-  cfg.set('model',           $('model-select').value);
   cfg.set('voiceEnabled',    $('voice-toggle').checked);
-  cfg.set('feedbackInterval', parseInt(intervalSlider.value, 10));
   const newEx = $('exercise-select').value;
   cfg.set('exercise', newEx);
   applyExercise(newEx);
@@ -412,18 +601,14 @@ saveSettings.addEventListener('click', () => {
   closeSettingsPanel();
 });
 
-resetReps.addEventListener('click', () => {
-  if (repCounter) repCounter.reset();
+on(resetReps, 'click', () => {
+  resetSetState(setState === 'active' ? 'ready' : setState);
   repCountEl.textContent = '0';
 });
 
-intervalSlider.addEventListener('input', () => {
-  intervalVal.textContent = intervalSlider.value + 's';
-});
-
 // Swipe right to close settings on mobile
-settingsPanel.addEventListener('touchstart', (e) => { settingsPanel._tx = e.touches[0].clientX; });
-settingsPanel.addEventListener('touchend', (e) => {
+on(settingsPanel, 'touchstart', (e) => { settingsPanel._tx = e.touches[0].clientX; });
+on(settingsPanel, 'touchend', (e) => {
   if (e.changedTouches[0].clientX - settingsPanel._tx > 60) closeSettingsPanel();
 });
 
@@ -431,9 +616,17 @@ settingsPanel.addEventListener('touchend', (e) => {
 function setLoading(msg) { loadingOv.classList.remove('hidden'); loadingMsg.textContent = msg; }
 function hideLoading()   { loadingOv.classList.add('hidden'); }
 
+async function loadServerConfig() {
+  try {
+    const res = await fetch('/api/config', { cache: 'no-store' });
+    if (res.ok) serverConfig = await res.json();
+  } catch {}
+}
+
 // ─── Boot ────────────────────────────────────────────────────────────────────
 (async () => {
   cfg.load();
+  await loadServerConfig();
   populateExerciseSelect();
   applyExercise(cfg.get('exercise') || 'pullup');
   resizeCanvas();
@@ -446,6 +639,7 @@ function hideLoading()   { loadingOv.classList.add('hidden'); }
   }, { once: true });
 
   await initPose();
+  updateCameraControls();
 
-  if (!cfg.get('openrouterKey')) openSettings();
+  if (!cfg.get('openrouterKey') && !serverConfig.openrouter) openSettings();
 })();
